@@ -32,9 +32,20 @@ if (!STRIPE_SECRET_KEY || !STRIPE_PAYMENT_LINK_URL || !STRIPE_PRICE_ID || !JWT_S
 }
 
 const app = express();
-app.use(cors({ origin: APP_DOMAIN_ORIGIN, credentials: true }));
+
+// Flexible origin list: comma-separated APP_DOMAIN_ORIGIN supported
+const allowedOrigins = String(APP_DOMAIN_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    return cb(null, false);
+  },
+  credentials: true,
+}));
+
 app.use(express.json());
 app.use(cookieParser());
+app.set('trust proxy', 1);
 
 const stripe = new Stripe(STRIPE_SECRET_KEY);
 
@@ -64,11 +75,14 @@ function uaHash(ua) {
 }
 
 function signAuthCookie(res, payload) {
+  // Use Lax for first-party (when COOKIE_DOMAIN like .dearmaryj.com is set),
+  // fall back to None for cross-site (Railway default domain).
+  const sameSite = process.env.COOKIE_SAMESITE || (COOKIE_DOMAIN ? 'lax' : 'none');
   const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '1095d' }); // ~3 years
   const cookieOpts = {
     httpOnly: true,
     secure: COOKIE_SECURE === 'true',
-    sameSite: 'lax',
+    sameSite,
     path: '/',
     maxAge: 1000 * 60 * 60 * 24 * 365 * 3 // 3 years
   };
