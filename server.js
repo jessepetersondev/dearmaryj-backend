@@ -43,7 +43,6 @@ app.use(cors({
   credentials: true,
 }));
 
-app.use(express.json());
 app.use(cookieParser());
 app.set('trust proxy', 1);
 
@@ -115,6 +114,58 @@ const validateLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
+
+/**
+ * IMPORTANT: Stripe webhook must receive the RAW body.
+ * We register the webhook route BEFORE express.json(), and use bodyParser.raw().
+ */
+app.post('/webhooks/stripe', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
+  if (!STRIPE_WEBHOOK_SECRET) return res.status(400).send('Webhook not configured');
+
+  let event;
+  try {
+    const sig = req.headers['stripe-signature'];
+    // req.body is a Buffer here (because of bodyParser.raw)
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature verification failed.', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      if (session.payment_status !== 'paid') return res.json({ received: true });
+
+      const full = await stripe.checkout.sessions.retrieve(session.id, { expand: ['line_items.data.price'] });
+      const items = full.line_items?.data || [];
+      const hasExpectedPrice = items.some(i => i.price?.id === STRIPE_PRICE_ID);
+      if (!hasExpectedPrice) return res.json({ received: true });
+
+      if (pool) {
+        const email = full.customer_details?.email || null;
+        const customerId = full.customer || null;
+        await pool.query(`
+          INSERT INTO dmj_entitlements (customer_id, email, price_id, latest_session_id, active)
+          VALUES ($1,$2,$3,$4,TRUE)
+          ON CONFLICT (customer_id) DO UPDATE SET
+            email=EXCLUDED.email,
+            price_id=EXCLUDED.price_id,
+            latest_session_id=EXCLUDED.latest_session_id,
+            active=TRUE,
+            updated_at=now();
+        `, [customerId || `guest:${email || 'unknown'}`, email, STRIPE_PRICE_ID, full.id]);
+      }
+    }
+    res.json({ received: true });
+  } catch (e) {
+    console.error('Webhook handler error', e);
+    res.status(500).send('Webhook handler error');
+  }
+});
+
+// AFTER the webhook route, it's safe to parse JSON for normal API routes
+app.use(express.json());
 
 // --- Routes ---
 app.get('/api/health', (req, res) => res.json({ ok: true }));
@@ -195,50 +246,6 @@ app.post('/api/restore', async (req, res) => {
   } catch (e) {
     console.error('restore error', e);
     res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// Stripe webhook to persist entitlements robustly (checkout.session.completed)
-app.post('/webhooks/stripe', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
-  if (!STRIPE_WEBHOOK_SECRET) return res.status(400).send('Webhook not configured');
-  let event;
-  try {
-    const sig = req.headers['stripe-signature'];
-    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error('Webhook signature verification failed.', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  try {
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object;
-      if (session.payment_status !== 'paid') return res.json({ received: true });
-
-      const full = await stripe.checkout.sessions.retrieve(session.id, { expand: ['line_items.data.price'] });
-      const items = full.line_items?.data || [];
-      const hasExpectedPrice = items.some(i => i.price?.id === STRIPE_PRICE_ID);
-      if (!hasExpectedPrice) return res.json({ received: true });
-
-      if (pool) {
-        const email = full.customer_details?.email || null;
-        const customerId = full.customer || null;
-        await pool.query(`
-          INSERT INTO dmj_entitlements (customer_id, email, price_id, latest_session_id, active)
-          VALUES ($1,$2,$3,$4,TRUE)
-          ON CONFLICT (customer_id) DO UPDATE SET
-            email=EXCLUDED.email,
-            price_id=EXCLUDED.price_id,
-            latest_session_id=EXCLUDED.latest_session_id,
-            active=TRUE,
-            updated_at=now();
-        `, [customerId || `guest:${email || 'unknown'}`, email, STRIPE_PRICE_ID, full.id]);
-      }
-    }
-    res.json({ received: true });
-  } catch (e) {
-    console.error('Webhook handler error', e);
-    res.status(500).send('Webhook handler error');
   }
 });
 
