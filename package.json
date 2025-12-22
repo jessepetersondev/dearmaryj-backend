@@ -15,7 +15,6 @@
     "express": "^4.19.2",
     "express-rate-limit": "^7.1.5",
     "jsonwebtoken": "^9.0.2",
-    "pg": "^8.11.5",
-    "stripe": "^16.8.0"
+    "pg": "^8.11.5"
   }
 }

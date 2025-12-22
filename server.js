@@ -2,7 +2,6 @@ import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import jwt from 'jsonwebtoken';
-import Stripe from 'stripe';
 import rateLimit from 'express-rate-limit';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
@@ -14,10 +13,12 @@ dotenv.config();
 
 const {
   PORT = 8080,
-  STRIPE_SECRET_KEY,
-  STRIPE_PAYMENT_LINK_URL,
-  STRIPE_PRICE_ID,
-  STRIPE_WEBHOOK_SECRET, // optional but recommended
+  BTCPAY_SERVER_URL, // e.g., https://your-btcpay-server.com
+  BTCPAY_STORE_ID,
+  BTCPAY_API_KEY,
+  BTCPAY_WEBHOOK_SECRET, // optional but highly recommended
+  BTCPAY_PAYMENT_AMOUNT, // amount in base currency (e.g., USD)
+  BTCPAY_CURRENCY = 'USD', // currency code
   JWT_SECRET,
   COOKIE_NAME = 'dmj_auth',
   COOKIE_DOMAIN,
@@ -26,8 +27,8 @@ const {
   DATABASE_URL // optional but recommended for restore
 } = process.env;
 
-if (!STRIPE_SECRET_KEY || !STRIPE_PAYMENT_LINK_URL || !STRIPE_PRICE_ID || !JWT_SECRET || !APP_DOMAIN_ORIGIN) {
-  console.error('Missing required env vars. Please set STRIPE_SECRET_KEY, STRIPE_PAYMENT_LINK_URL, STRIPE_PRICE_ID, JWT_SECRET, APP_DOMAIN_ORIGIN');
+if (!BTCPAY_SERVER_URL || !BTCPAY_STORE_ID || !BTCPAY_API_KEY || !BTCPAY_PAYMENT_AMOUNT || !JWT_SECRET || !APP_DOMAIN_ORIGIN) {
+  console.error('Missing required env vars. Please set BTCPAY_SERVER_URL, BTCPAY_STORE_ID, BTCPAY_API_KEY, BTCPAY_PAYMENT_AMOUNT, JWT_SECRET, APP_DOMAIN_ORIGIN');
   process.exit(1);
 }
 
@@ -46,7 +47,80 @@ app.use(cors({
 app.use(cookieParser());
 app.set('trust proxy', 1);
 
-const stripe = new Stripe(STRIPE_SECRET_KEY);
+// --- BTCPay Server API Helper Functions ---
+const btcpayApi = {
+  /**
+   * Create an invoice on BTCPay Server
+   * @param {Object} params - Invoice parameters
+   * @returns {Promise<Object>} Invoice object
+   */
+  async createInvoice(params) {
+    const url = `${BTCPAY_SERVER_URL}/api/v1/stores/${BTCPAY_STORE_ID}/invoices`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `token ${BTCPAY_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(params),
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`BTCPay API Error: ${response.status} ${error}`);
+    }
+
+    return await response.json();
+  },
+
+  /**
+   * Get invoice details from BTCPay Server
+   * @param {string} invoiceId - Invoice ID
+   * @returns {Promise<Object>} Invoice object
+   */
+  async getInvoice(invoiceId) {
+    const url = `${BTCPAY_SERVER_URL}/api/v1/stores/${BTCPAY_STORE_ID}/invoices/${invoiceId}`;
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Authorization': `token ${BTCPAY_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`BTCPay API Error: ${response.status} ${error}`);
+    }
+
+    return await response.json();
+  },
+
+  /**
+   * Verify webhook signature
+   * @param {string} payload - Raw request body
+   * @param {string} signature - Signature from request header
+   * @returns {boolean} True if signature is valid
+   */
+  verifyWebhookSignature(payload, signature) {
+    if (!BTCPAY_WEBHOOK_SECRET) return true; // Skip verification if no secret is set
+    
+    const expectedSignature = crypto
+      .createHmac('sha256', BTCPAY_WEBHOOK_SECRET)
+      .update(payload)
+      .digest('hex');
+    
+    // BTCPay sends signature as "sha256=<signature>"
+    const providedSignature = signature.startsWith('sha256=') 
+      ? signature.slice(7) 
+      : signature;
+    
+    return crypto.timingSafeEqual(
+      Buffer.from(expectedSignature),
+      Buffer.from(providedSignature)
+    );
+  },
+};
 
 // --- Optional: DB for cross-device lifetime restore ---
 let pool = null;
@@ -57,13 +131,15 @@ let pool = null;
       CREATE TABLE IF NOT EXISTS dmj_entitlements (
         customer_id TEXT PRIMARY KEY,
         email TEXT,
-        price_id TEXT,
-        latest_session_id TEXT UNIQUE,
+        invoice_id TEXT UNIQUE,
+        amount NUMERIC,
+        currency TEXT,
         active BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMPTZ DEFAULT now(),
         updated_at TIMESTAMPTZ DEFAULT now()
       );
       CREATE INDEX IF NOT EXISTS dmj_entitlements_email_idx ON dmj_entitlements ((lower(email)));
+      CREATE INDEX IF NOT EXISTS dmj_entitlements_invoice_idx ON dmj_entitlements (invoice_id);
     `);
   }
 })().catch(e => console.error('DB init error', e));
@@ -116,47 +192,74 @@ const validateLimiter = rateLimit({
 });
 
 /**
- * IMPORTANT: Stripe webhook must receive the RAW body.
+ * IMPORTANT: BTCPay webhook must receive the RAW body.
  * We register the webhook route BEFORE express.json(), and use bodyParser.raw().
  */
-app.post('/webhooks/stripe', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
-  if (!STRIPE_WEBHOOK_SECRET) return res.status(400).send('Webhook not configured');
-
+app.post('/webhooks/btcpay', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
+  let payload;
   let event;
+
   try {
-    const sig = req.headers['stripe-signature'];
-    // req.body is a Buffer here (because of bodyParser.raw)
-    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    // Verify webhook signature if secret is configured
+    const signature = req.headers['btcpay-sig'];
+    if (BTCPAY_WEBHOOK_SECRET) {
+      const isValid = btcpayApi.verifyWebhookSignature(req.body.toString(), signature);
+      if (!isValid) {
+        console.error('Webhook signature verification failed');
+        return res.status(400).send('Invalid signature');
+      }
+    }
+
+    // Parse the webhook payload
+    payload = JSON.parse(req.body.toString());
+    event = payload;
   } catch (err) {
-    console.error('Webhook signature verification failed.', err.message);
+    console.error('Webhook parsing error:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
   try {
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object;
-      if (session.payment_status !== 'paid') return res.json({ received: true });
-
-      const full = await stripe.checkout.sessions.retrieve(session.id, { expand: ['line_items.data.price'] });
-      const items = full.line_items?.data || [];
-      const hasExpectedPrice = items.some(i => i.price?.id === STRIPE_PRICE_ID);
-      if (!hasExpectedPrice) return res.json({ received: true });
-
-      if (pool) {
-        const email = full.customer_details?.email || null;
-        const customerId = full.customer || null;
-        await pool.query(`
-          INSERT INTO dmj_entitlements (customer_id, email, price_id, latest_session_id, active)
-          VALUES ($1,$2,$3,$4,TRUE)
-          ON CONFLICT (customer_id) DO UPDATE SET
-            email=EXCLUDED.email,
-            price_id=EXCLUDED.price_id,
-            latest_session_id=EXCLUDED.latest_session_id,
-            active=TRUE,
-            updated_at=now();
-        `, [customerId || `guest:${email || 'unknown'}`, email, STRIPE_PRICE_ID, full.id]);
+    // BTCPay webhook event types: InvoiceCreated, InvoiceReceivedPayment, 
+    // InvoiceProcessing, InvoiceExpired, InvoiceSettled, InvoiceInvalid
+    
+    if (event.type === 'InvoiceSettled' || event.type === 'InvoiceProcessing') {
+      // Invoice has been paid and confirmed (Settled) or is processing
+      const invoiceId = event.invoiceId;
+      
+      // Fetch full invoice details
+      const invoice = await btcpayApi.getInvoice(invoiceId);
+      
+      // Verify invoice status and amount
+      if (invoice.status !== 'Settled' && invoice.status !== 'Processing') {
+        console.log(`Invoice ${invoiceId} not settled/processing, skipping`);
+        return res.json({ received: true });
       }
+
+      // Extract metadata (email, customer_id, etc.)
+      const metadata = invoice.metadata || {};
+      const email = metadata.buyerEmail || metadata.email || null;
+      const customerId = metadata.customerId || `invoice:${invoiceId}`;
+
+      // Store entitlement in database
+      if (pool) {
+        await pool.query(`
+          INSERT INTO dmj_entitlements (customer_id, email, invoice_id, amount, currency, active)
+          VALUES ($1, $2, $3, $4, $5, TRUE)
+          ON CONFLICT (customer_id) DO UPDATE SET
+            email = EXCLUDED.email,
+            invoice_id = EXCLUDED.invoice_id,
+            amount = EXCLUDED.amount,
+            currency = EXCLUDED.currency,
+            active = TRUE,
+            updated_at = now();
+        `, [customerId, email, invoiceId, invoice.amount, invoice.currency]);
+        
+        console.log(`Entitlement stored for invoice ${invoiceId}, customer ${customerId}`);
+      }
+    } else if (event.type === 'InvoiceExpired' || event.type === 'InvoiceInvalid') {
+      console.log(`Invoice ${event.invoiceId} expired or invalid`);
     }
+
     res.json({ received: true });
   } catch (e) {
     console.error('Webhook handler error', e);
@@ -170,9 +273,37 @@ app.use(express.json());
 // --- Routes ---
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
-// Redirect to Stripe Payment Link (no secrets on client)
-app.get('/api/pay', (req, res) => {
-  res.redirect(302, STRIPE_PAYMENT_LINK_URL);
+// Create BTCPay invoice and return checkout URL
+app.post('/api/pay', async (req, res) => {
+  try {
+    const { email, customerId } = req.body || {};
+    
+    // Create invoice on BTCPay Server
+    const invoice = await btcpayApi.createInvoice({
+      amount: BTCPAY_PAYMENT_AMOUNT,
+      currency: BTCPAY_CURRENCY,
+      metadata: {
+        buyerEmail: email || undefined,
+        customerId: customerId || undefined,
+        orderId: `dmj-${Date.now()}`,
+        itemDesc: 'Dear Mary J Subscription',
+      },
+      checkout: {
+        redirectURL: `${allowedOrigins[0]}/payment-success?invoice_id={InvoiceId}`,
+        redirectAutomatically: true,
+        defaultLanguage: 'en-US',
+      },
+    });
+
+    // Return the checkout URL to the client
+    res.json({
+      checkoutUrl: invoice.checkoutLink,
+      invoiceId: invoice.id,
+    });
+  } catch (error) {
+    console.error('Create invoice error:', error);
+    res.status(500).json({ error: 'Failed to create invoice' });
+  }
 });
 
 // Client checks if already unlocked (cookie)
@@ -180,40 +311,51 @@ app.get('/api/auth/status', (req, res) => {
   res.json({ unlocked: verifyAuth(req) });
 });
 
-// Validate Stripe Checkout session on return from success
-app.post('/api/validate-session', validateLimiter, async (req, res) => {
+// Validate BTCPay invoice on return from success
+app.post('/api/validate-invoice', validateLimiter, async (req, res) => {
   try {
-    const { session_id } = req.body || {};
-    if (!session_id) return res.status(400).json({ error: 'Missing session_id' });
+    const { invoice_id } = req.body || {};
+    if (!invoice_id) return res.status(400).json({ error: 'Missing invoice_id' });
 
-    // Verify with Stripe
-    const session = await stripe.checkout.sessions.retrieve(session_id, { expand: ['line_items.data.price'] });
-    if (!session || session.mode !== 'payment') return res.status(400).json({ error: 'Invalid session' });
+    // Verify with BTCPay Server
+    const invoice = await btcpayApi.getInvoice(invoice_id);
+    if (!invoice) return res.status(400).json({ error: 'Invalid invoice' });
 
-    const paid = (session.payment_status === 'paid') || (session.status === 'complete');
-    if (!paid) return res.status(402).json({ error: 'Payment not completed' });
+    // Check if invoice is paid
+    const isPaid = invoice.status === 'Settled' || invoice.status === 'Processing';
+    if (!isPaid) {
+      return res.status(402).json({ 
+        error: 'Payment not completed', 
+        status: invoice.status 
+      });
+    }
 
-    // Ensure expected price was purchased
-    const items = session.line_items?.data || [];
-    const hasExpectedPrice = items.some(i => i.price?.id === STRIPE_PRICE_ID);
-    if (!hasExpectedPrice) return res.status(400).json({ error: 'Unexpected price' });
+    // Verify amount matches expected amount
+    const expectedAmount = parseFloat(BTCPAY_PAYMENT_AMOUNT);
+    const invoiceAmount = parseFloat(invoice.amount);
+    if (Math.abs(invoiceAmount - expectedAmount) > 0.01) {
+      return res.status(400).json({ error: 'Unexpected amount' });
+    }
+
+    // Extract metadata
+    const metadata = invoice.metadata || {};
+    const email = metadata.buyerEmail || metadata.email || null;
+    const customerId = metadata.customerId || `invoice:${invoice_id}`;
 
     // Persist entitlement (optional but recommended)
-    const email = session.customer_details?.email || null;
-    const customerId = session.customer || null;
-
-    if (pool && (email || customerId)) {
+    if (pool) {
       try {
         await pool.query(`
-          INSERT INTO dmj_entitlements (customer_id, email, price_id, latest_session_id, active)
-          VALUES ($1,$2,$3,$4,TRUE)
+          INSERT INTO dmj_entitlements (customer_id, email, invoice_id, amount, currency, active)
+          VALUES ($1, $2, $3, $4, $5, TRUE)
           ON CONFLICT (customer_id) DO UPDATE SET
-            email=EXCLUDED.email,
-            price_id=EXCLUDED.price_id,
-            latest_session_id=EXCLUDED.latest_session_id,
-            active=TRUE,
-            updated_at=now();
-        `, [customerId || `guest:${email || 'unknown'}`, email, STRIPE_PRICE_ID, session.id]);
+            email = EXCLUDED.email,
+            invoice_id = EXCLUDED.invoice_id,
+            amount = EXCLUDED.amount,
+            currency = EXCLUDED.currency,
+            active = TRUE,
+            updated_at = now();
+        `, [customerId, email, invoice_id, invoice.amount, invoice.currency]);
       } catch (dbErr) {
         console.error('DB upsert error', dbErr);
       }
@@ -221,16 +363,16 @@ app.post('/api/validate-session', validateLimiter, async (req, res) => {
 
     // Issue long-lived HttpOnly cookie (lightly bound to UA)
     const uah = uaHash(req.headers['user-agent']);
-    signAuthCookie(res, { sub: `checkout:${session.id}`, scope: 'unlocked', uah });
+    signAuthCookie(res, { sub: `invoice:${invoice_id}`, scope: 'unlocked', uah });
 
     res.json({ unlocked: true });
   } catch (err) {
-    console.error('validate-session error', err);
+    console.error('validate-invoice error', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Restore across devices by email (requires DATABASE_URL + webhook/validate-session persistence)
+// Restore across devices by email (requires DATABASE_URL + webhook/validate-invoice persistence)
 app.post('/api/restore', async (req, res) => {
   try {
     if (!pool) return res.status(500).json({ error: 'Restore requires DATABASE_URL configured.' });
@@ -252,4 +394,77 @@ app.post('/api/restore', async (req, res) => {
 // Optional logout helper
 app.post('/api/logout', (req, res) => { clearAuthCookie(res); res.json({ ok: true }); });
 
-app.listen(PORT, () => console.log(`DMJ backend running on :${PORT}`));
+// --- Subscription Management Endpoints ---
+
+/**
+ * Get subscription status for a customer
+ * This checks if a customer has an active entitlement
+ */
+app.get('/api/subscription/status', async (req, res) => {
+  try {
+    if (!verifyAuth(req)) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const token = req.cookies?.[COOKIE_NAME];
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const customerId = decoded.sub;
+
+    if (!pool) {
+      return res.json({ active: true }); // If no DB, assume active based on cookie
+    }
+
+    const result = await pool.query(
+      `SELECT active, created_at, updated_at FROM dmj_entitlements WHERE customer_id = $1`,
+      [customerId.replace(/^(invoice:|restore:|checkout:)/, '')]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ active: false });
+    }
+
+    res.json({
+      active: result.rows[0].active,
+      since: result.rows[0].created_at,
+      lastUpdated: result.rows[0].updated_at,
+    });
+  } catch (e) {
+    console.error('subscription status error', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/**
+ * Cancel subscription
+ * Since BTCPay doesn't have recurring subscriptions, this just marks the entitlement as inactive
+ */
+app.post('/api/subscription/cancel', async (req, res) => {
+  try {
+    if (!verifyAuth(req)) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const token = req.cookies?.[COOKIE_NAME];
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const customerId = decoded.sub;
+
+    if (!pool) {
+      // If no DB, just clear the cookie
+      clearAuthCookie(res);
+      return res.json({ success: true, message: 'Access revoked' });
+    }
+
+    await pool.query(
+      `UPDATE dmj_entitlements SET active = FALSE, updated_at = now() WHERE customer_id = $1`,
+      [customerId.replace(/^(invoice:|restore:|checkout:)/, '')]
+    );
+
+    clearAuthCookie(res);
+    res.json({ success: true, message: 'Subscription cancelled' });
+  } catch (e) {
+    console.error('subscription cancel error', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.listen(PORT, () => console.log(`DMJ backend running on :${PORT} (BTCPay Server integration)`));
