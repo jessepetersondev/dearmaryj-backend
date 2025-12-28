@@ -8,6 +8,7 @@ import dotenv from 'dotenv';
 import pkg from 'pg';
 const { Pool } = pkg;
 import bodyParser from 'body-parser';
+import axios from 'axios';
 
 dotenv.config();
 
@@ -56,25 +57,23 @@ const btcpayApi = {
    */
   async createInvoice(params) {
     const url = `${BTCPAY_SERVER_URL}/api/v1/stores/${BTCPAY_STORE_ID}/invoices`;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 150000); // 150 second timeout
     
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `token ${BTCPAY_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(params),
-      signal: controller.signal,
-    }).finally(() => clearTimeout(timeoutId));
+    try {
+      const response = await axios.post(url, params, {
+        headers: {
+          'Authorization': `token ${BTCPAY_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 180000, // 180 seconds (3 minutes)
+      });
 
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`BTCPay API Error: ${response.status} ${error}`);
+      return response.data;
+    } catch (error) {
+      if (error.response) {
+        throw new Error(`BTCPay API Error: ${error.response.status} ${error.response.data}`);
+      }
+      throw error;
     }
-
-    return await response.json();
   },
 
   /**
@@ -84,24 +83,23 @@ const btcpayApi = {
    */
   async getInvoice(invoiceId) {
     const url = `${BTCPAY_SERVER_URL}/api/v1/stores/${BTCPAY_STORE_ID}/invoices/${invoiceId}`;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 150000); // 150 second timeout
     
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'Authorization': `token ${BTCPAY_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      signal: controller.signal,
-    }).finally(() => clearTimeout(timeoutId));
+    try {
+      const response = await axios.get(url, {
+        headers: {
+          'Authorization': `token ${BTCPAY_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 180000, // 180 seconds (3 minutes)
+      });
 
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`BTCPay API Error: ${response.status} ${error}`);
+      return response.data;
+    } catch (error) {
+      if (error.response) {
+        throw new Error(`BTCPay API Error: ${error.response.status} ${error.response.data}`);
+      }
+      throw error;
     }
-
-    return await response.json();
   },
 
   /**
