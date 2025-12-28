@@ -56,6 +56,9 @@ const btcpayApi = {
    */
   async createInvoice(params) {
     const url = `${BTCPAY_SERVER_URL}/api/v1/stores/${BTCPAY_STORE_ID}/invoices`;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 150000); // 150 second timeout
+    
     const response = await fetch(url, {
       method: 'POST',
       headers: {
@@ -63,7 +66,8 @@ const btcpayApi = {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(params),
-    });
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeoutId));
 
     if (!response.ok) {
       const error = await response.text();
@@ -80,13 +84,17 @@ const btcpayApi = {
    */
   async getInvoice(invoiceId) {
     const url = `${BTCPAY_SERVER_URL}/api/v1/stores/${BTCPAY_STORE_ID}/invoices/${invoiceId}`;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 150000); // 150 second timeout
+    
     const response = await fetch(url, {
       method: 'GET',
       headers: {
         'Authorization': `token ${BTCPAY_API_KEY}`,
         'Content-Type': 'application/json',
       },
-    });
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeoutId));
 
     if (!response.ok) {
       const error = await response.text();
