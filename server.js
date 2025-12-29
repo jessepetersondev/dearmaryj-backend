@@ -35,8 +35,6 @@ if (!BTCPAY_SERVER_URL || !BTCPAY_STORE_ID || !BTCPAY_API_KEY || !BTCPAY_PAYMENT
 
 console.log('=== Environment Configuration ===');
 console.log('BTCPAY_SERVER_URL:', BTCPAY_SERVER_URL);
-console.log('BTCPAY_STORE_ID:', BTCPAY_STORE_ID);
-console.log('BTCPAY_API_KEY:', BTCPAY_API_KEY?.substring(0, 20) + '...');
 console.log('BTCPAY_PAYMENT_AMOUNT:', BTCPAY_PAYMENT_AMOUNT);
 console.log('BTCPAY_CURRENCY:', BTCPAY_CURRENCY);
 console.log('=================================');
@@ -496,4 +494,3 @@ app.post('/api/subscription/cancel', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`DMJ backend running on :${PORT} (BTCPay Server integration)`));
-
