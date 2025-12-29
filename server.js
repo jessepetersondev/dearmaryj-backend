@@ -35,6 +35,8 @@ if (!BTCPAY_SERVER_URL || !BTCPAY_STORE_ID || !BTCPAY_API_KEY || !BTCPAY_PAYMENT
 
 console.log('=== Environment Configuration ===');
 console.log('BTCPAY_SERVER_URL:', BTCPAY_SERVER_URL);
+console.log('BTCPAY_STORE_ID:', BTCPAY_STORE_ID);
+console.log('BTCPAY_API_KEY:', BTCPAY_API_KEY?.substring(0, 20) + '...');
 console.log('BTCPAY_PAYMENT_AMOUNT:', BTCPAY_PAYMENT_AMOUNT);
 console.log('BTCPAY_CURRENCY:', BTCPAY_CURRENCY);
 console.log('=================================');
@@ -61,7 +63,7 @@ const btcpayApi = {
    * @param {Object} params - Invoice parameters
    * @returns {Promise<Object>} Invoice object
    */
-  async createInvoice(params) {
+  async createInvoice(params, retries = 2) {
     const url = `${BTCPAY_SERVER_URL}/api/v1/stores/${BTCPAY_STORE_ID}/invoices`;
     
     console.log('=== BTCPay Create Invoice Request ===');
@@ -69,6 +71,7 @@ const btcpayApi = {
     console.log('Store ID:', BTCPAY_STORE_ID);
     console.log('API Key (first 20 chars):', BTCPAY_API_KEY?.substring(0, 20) + '...');
     console.log('Request params:', JSON.stringify(params, null, 2));
+    console.log('Retries remaining:', retries);
     
     try {
       const response = await axios.post(url, params, {
@@ -86,8 +89,17 @@ const btcpayApi = {
         status: error.response?.status,
         statusText: error.response?.statusText,
         data: error.response?.data,
-        message: error.message
+        message: error.message,
+        code: error.code
       });
+      
+      // Retry on timeout or connection errors
+      if ((error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') && retries > 0) {
+        console.log(`⚠️ Timeout error, retrying... (${retries} attempts left)`);
+        await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
+        return this.createInvoice(params, retries - 1);
+      }
+      
       if (error.response) {
         throw new Error(`BTCPay API Error: ${error.response.status} ${JSON.stringify(error.response.data)}`);
       }
@@ -328,7 +340,24 @@ app.post('/api/pay', async (req, res) => {
     });
   } catch (error) {
     console.error('Create invoice error:', error);
-    res.status(500).json({ error: 'Failed to create invoice' });
+    
+    // Provide helpful error messages
+    if (error.code === 'ETIMEDOUT') {
+      res.status(503).json({ 
+        error: 'Payment server is temporarily slow. Please try again in a moment.',
+        code: 'TIMEOUT'
+      });
+    } else if (error.message?.includes('404')) {
+      res.status(500).json({ 
+        error: 'Payment configuration error. Please contact support.',
+        code: 'CONFIG_ERROR'
+      });
+    } else {
+      res.status(500).json({ 
+        error: 'Failed to create payment. Please try again.',
+        code: 'UNKNOWN'
+      });
+    }
   }
 });
 
