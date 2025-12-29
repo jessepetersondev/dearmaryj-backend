@@ -33,6 +33,14 @@ if (!BTCPAY_SERVER_URL || !BTCPAY_STORE_ID || !BTCPAY_API_KEY || !BTCPAY_PAYMENT
   process.exit(1);
 }
 
+console.log('=== Environment Configuration ===');
+console.log('BTCPAY_SERVER_URL:', BTCPAY_SERVER_URL);
+console.log('BTCPAY_STORE_ID:', BTCPAY_STORE_ID);
+console.log('BTCPAY_API_KEY:', BTCPAY_API_KEY?.substring(0, 20) + '...');
+console.log('BTCPAY_PAYMENT_AMOUNT:', BTCPAY_PAYMENT_AMOUNT);
+console.log('BTCPAY_CURRENCY:', BTCPAY_CURRENCY);
+console.log('=================================');
+
 const app = express();
 
 // Flexible origin list: comma-separated APP_DOMAIN_ORIGIN supported
@@ -58,6 +66,12 @@ const btcpayApi = {
   async createInvoice(params) {
     const url = `${BTCPAY_SERVER_URL}/api/v1/stores/${BTCPAY_STORE_ID}/invoices`;
     
+    console.log('=== BTCPay Create Invoice Request ===');
+    console.log('URL:', url);
+    console.log('Store ID:', BTCPAY_STORE_ID);
+    console.log('API Key (first 20 chars):', BTCPAY_API_KEY?.substring(0, 20) + '...');
+    console.log('Request params:', JSON.stringify(params, null, 2));
+    
     try {
       const response = await axios.post(url, params, {
         headers: {
@@ -67,10 +81,17 @@ const btcpayApi = {
         timeout: 180000, // 180 seconds (3 minutes)
       });
 
+      console.log('✅ Invoice created successfully:', response.data.id);
       return response.data;
     } catch (error) {
+      console.error('❌ BTCPay API Error:', {
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        data: error.response?.data,
+        message: error.message
+      });
       if (error.response) {
-        throw new Error(`BTCPay API Error: ${error.response.status} ${error.response.data}`);
+        throw new Error(`BTCPay API Error: ${error.response.status} ${JSON.stringify(error.response.data)}`);
       }
       throw error;
     }
@@ -283,6 +304,7 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 app.post('/api/pay', async (req, res) => {
   try {
     const { email, customerId } = req.body || {};
+    console.log('📝 /api/pay called with:', { email, customerId });
     
     // Create invoice on BTCPay Server
     const invoice = await btcpayApi.createInvoice({
