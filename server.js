@@ -315,7 +315,7 @@ app.post('/api/pay', async (req, res) => {
         itemDesc: 'Dear Mary J Subscription',
       },
       checkout: {
-        redirectURL: `${allowedOrigins[0]}/payment-success?invoice_id={InvoiceId}`,
+        redirectURL: `${allowedOrigins[0]}/?invoice_id={InvoiceId}`,
         redirectAutomatically: true,
         defaultLanguage: 'en-US',
       },
@@ -494,3 +494,4 @@ app.post('/api/subscription/cancel', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`DMJ backend running on :${PORT} (BTCPay Server integration)`));
+
