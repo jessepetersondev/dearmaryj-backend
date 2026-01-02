@@ -523,4 +523,3 @@ app.post('/api/subscription/cancel', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`DMJ backend running on :${PORT} (BTCPay Server integration)`));
-
